@@ -29,8 +29,9 @@ impl NativeViewId {
 
 /// A view owned by the platform's UI toolkit, shown inside a GPUI window.
 ///
-/// Only macOS shows native views so far, where the view is an `NSView`.
-/// [`NativeView::new`] fails on every other platform.
+/// macOS and X11 show native views, where the view is an `NSView` or an X
+/// window. [`NativeView::new`] fails on every other platform, including
+/// Wayland, where an app can show native views by running through XWayland.
 ///
 /// The view is composited beneath the window's GPUI content and shows through
 /// wherever this handle is used as an element, so elements painted after it
@@ -65,6 +66,12 @@ impl NativeViewId {
 /// than once in a frame, it shows only where it was painted first. It shows
 /// nothing as an element of any other window, so showing the same platform
 /// view in another window takes dropping this handle and creating one there.
+///
+/// On X11 the view is shown above GPUI's content instead, cut away wherever
+/// an element is painted after it, so translucent elements and shadows don't
+/// blend with it, and an element drawn over it takes its mouse input. X11
+/// doesn't say whether the view used a key, so only reserved and pending key
+/// bindings apply to keys pressed in it.
 #[derive(Clone)]
 pub struct NativeView(Rc<NativeViewState>);
 
@@ -83,19 +90,25 @@ impl NativeView {
     /// # Errors
     ///
     /// Fails on platforms that cannot composite native views, which is every
-    /// platform but macOS for now.
+    /// platform but macOS and X11 for now.
     ///
     /// # Safety
     ///
     /// `view` must point to a live view of the kind the window's platform
-    /// embeds, which is an `NSView` on macOS, and that view must not be in
-    /// another view hierarchy.
+    /// embeds, and that view must not be in another view hierarchy. That is an
+    /// `NSView` on macOS, and on X11 the ID of a window, cast to a pointer, on
+    /// the display GPUI is connected to.
     ///
     /// GPUI retains the view and puts it inside a view of its own, until the
     /// last clone of the returned handle is dropped. Until then GPUI decides the
     /// view's frame, whether it is hidden, and its order among the window's other
     /// views, so the caller must leave those alone and must not move the view to
     /// another superview.
+    ///
+    /// On X11 GPUI reparents the window into its own in the same way, and shows
+    /// and hides that one, so the caller may map the window but must not move or
+    /// resize it. Once the handle is dropped, the window is unmapped and back in
+    /// the root window.
     pub unsafe fn new(view: NonNull<c_void>, window: &mut Window, cx: &mut App) -> Result<Self> {
         let id = NativeViewId(window.next_native_view_id);
         // SAFETY: The caller upholds the platform's requirements for `view`.

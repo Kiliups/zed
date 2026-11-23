@@ -35,6 +35,8 @@ use std::{
 
 use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
 
+mod native_views;
+
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
         XA_ATOM,
@@ -254,6 +256,9 @@ pub struct Callbacks {
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
     button_layout_changed: Option<Box<dyn FnMut()>>,
+    hit_test_native_view: Option<Box<dyn FnMut(Point<Pixels>) -> Option<gpui::NativeViewId>>>,
+    native_view_focused: Option<Box<dyn FnMut(gpui::NativeViewId)>>,
+    key_down_before_native_view: Option<Box<dyn FnMut(gpui::KeyDownEvent) -> bool>>,
 }
 
 pub struct X11WindowState {
@@ -292,6 +297,7 @@ pub struct X11WindowState {
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    pub(crate) native_views: native_views::NativeViews,
 }
 
 impl X11WindowState {
@@ -863,6 +869,7 @@ impl X11WindowState {
                 accesskit_adapter: None,
                 counter_id: sync_request_counter,
                 last_sync_counter: None,
+                native_views: Default::default(),
             })
         });
 
@@ -887,6 +894,7 @@ pub(crate) struct X11Window(pub X11WindowStatePtr);
 impl Drop for X11Window {
     fn drop(&mut self) {
         let mut state = self.0.state.borrow_mut();
+        native_views::detach_all(&self.0, &mut state);
 
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&self.0.x_window);
@@ -1771,6 +1779,33 @@ impl PlatformWindow for X11Window {
     fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
     }
 
+    unsafe fn attach_native_view(
+        &self,
+        id: gpui::NativeViewId,
+        view: NonNull<c_void>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        native_views::attach(&self.0, id, view)
+    }
+
+    fn set_focused_native_view(&self, id: Option<gpui::NativeViewId>) {
+        self.0.set_focused_native_view(id);
+    }
+
+    fn on_hit_test_native_view(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<gpui::NativeViewId>>,
+    ) {
+        self.0.callbacks.borrow_mut().hit_test_native_view = Some(callback);
+    }
+
+    fn on_native_view_focused(&self, callback: Box<dyn FnMut(gpui::NativeViewId)>) {
+        self.0.callbacks.borrow_mut().native_view_focused = Some(callback);
+    }
+
+    fn on_key_down_before_native_view(&self, callback: Box<dyn FnMut(gpui::KeyDownEvent) -> bool>) {
+        self.0.callbacks.borrow_mut().key_down_before_native_view = Some(callback);
+    }
+
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
         self.0.callbacks.borrow_mut().appearance_changed = Some(callback);
     }
@@ -1780,8 +1815,8 @@ impl PlatformWindow for X11Window {
     }
 
     fn draw(&self, scene: &Scene) {
-        let mut inner = self.0.state.borrow_mut();
-        let inner = &mut *inner;
+        let mut state = self.0.state.borrow_mut();
+        let inner = &mut *state;
         let Some(renderer) = &mut inner.renderer else {
             return;
         };
@@ -1811,6 +1846,8 @@ impl PlatformWindow for X11Window {
         if renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
         }
+        drop(state);
+        native_views::apply_layout(&self.0, scene);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

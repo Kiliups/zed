@@ -1186,6 +1186,62 @@ impl From<PaintNativeView> for Primitive {
     }
 }
 
+impl PaintNativeView {
+    /// The part of the view that its content mask leaves visible.
+    pub fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds.intersect(&self.content_mask.bounds)
+    }
+}
+
+impl Scene {
+    /// The areas of a native view's visible bounds that the scene draws over.
+    ///
+    /// This is for platforms that show a native view above the window's content
+    /// with these areas cut away. Each is the clipped bounds of something painted
+    /// after the view, apart from shadows, which the view shows through.
+    pub fn native_view_covers(&self, native_view: &PaintNativeView) -> Vec<Bounds<ScaledPixels>> {
+        let visible = native_view.visible_bounds();
+        let mut covers = Vec::new();
+        let mut cover = |order, bounds: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+            let bounds = bounds.intersect(&mask.bounds).intersect(&visible);
+            if order > native_view.order && !bounds.is_empty() {
+                covers.push(bounds);
+            }
+        };
+        for quad in &self.quads {
+            if !quad.background.is_transparent() || !quad.border_color.is_transparent() {
+                cover(quad.order, quad.bounds, &quad.content_mask);
+            }
+        }
+        for path in &self.paths {
+            cover(path.order, path.bounds, &path.paint.content_mask);
+        }
+        for underline in &self.underlines {
+            cover(underline.order, underline.bounds, &underline.content_mask);
+        }
+        for sprite in &self.monochrome_sprites {
+            let bounds = sprite.transformation.transform_bounds(sprite.bounds);
+            cover(sprite.order, bounds, &sprite.content_mask);
+        }
+        for sprite in &self.subpixel_sprites {
+            let bounds = sprite.transformation.transform_bounds(sprite.bounds);
+            cover(sprite.order, bounds, &sprite.content_mask);
+        }
+        for sprite in &self.polychrome_sprites {
+            cover(sprite.order, sprite.bounds, &sprite.content_mask);
+        }
+        for surface in &self.surfaces {
+            cover(surface.order, surface.bounds, &surface.content_mask);
+        }
+        for other in &self.native_views {
+            if other.id != native_view.id {
+                cover(other.order, other.bounds, &other.content_mask);
+            }
+        }
+        covers
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -1419,5 +1475,58 @@ mod tests {
         scene.insert_primitive(quad(5.));
         scene.pop_layer();
         assert_eq!(batch_labels(&mut scene), ["underlines (1)", "quads (1)"]);
+    }
+
+    fn opaque_quad(x: f32) -> Quad {
+        Quad {
+            background: crate::black().into(),
+            ..quad(x)
+        }
+    }
+
+    #[test]
+    fn only_what_is_painted_after_a_native_view_covers_it() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(opaque_quad(0.));
+        let view_bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(30.), ScaledPixels(10.)),
+        );
+        scene.insert_primitive(PaintNativeView {
+            order: 0,
+            id: NativeViewId::for_test(1),
+            hitbox_id: HitboxId::placeholder(),
+            bounds: view_bounds,
+            content_mask: ContentMask {
+                bounds: view_bounds,
+            },
+            background: Hsla::default(),
+        });
+        scene.insert_primitive(opaque_quad(5.));
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(4.),
+            bounds: square(20.),
+            corner_radii: Corners::default(),
+            content_mask: ContentMask {
+                bounds: square(20.),
+            },
+            color: crate::black(),
+            shape_bounds: square(20.),
+            shape_corner_radii: Corners::default(),
+            inset: false.into(),
+            pad: 0,
+        });
+        // A quad that extends past the view only covers the part inside it.
+        scene.insert_primitive(opaque_quad(25.));
+        scene.finish();
+
+        let native_view = scene.native_views[0];
+        let covers = scene.native_view_covers(&native_view);
+        let horizontal_extents = covers
+            .iter()
+            .map(|cover| (cover.origin.x.0, cover.size.width.0))
+            .collect::<Vec<_>>();
+        assert_eq!(horizontal_extents, [(5., 10.), (25., 5.)]);
     }
 }

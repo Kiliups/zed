@@ -1366,7 +1366,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
 
-    /// Adds a platform view beneath the window's rendered content, hidden
+    /// Adds a platform view beneath the window's rendered content, or above it
+    /// with what is drawn over the view cut away (see
+    /// [`Scene::native_view_covers`](crate::Scene::native_view_covers)), hidden
     /// until a drawn scene contains a [`PaintNativeView`](crate::PaintNativeView)
     /// for it. Dropping the returned value removes the view from the window.
     /// Returns `None` when the platform cannot composite native views.

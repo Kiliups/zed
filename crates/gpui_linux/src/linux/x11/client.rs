@@ -745,6 +745,9 @@ impl X11Client {
             }
 
             for event in events.into_iter() {
+                let Some(event) = self.route_native_view_event(event) else {
+                    continue;
+                };
                 let mut state = self.0.borrow_mut();
                 if !state.has_xim() {
                     drop(state);
@@ -877,6 +880,162 @@ impl X11Client {
             .windows
             .get(&win)
             .map(|window_reference| window_reference.window.clone())
+    }
+
+    /// The window that `container` shows a native view in, with the container's
+    /// origin in it, in device pixels.
+    fn native_view_container(
+        &self,
+        container: xproto::Window,
+    ) -> Option<(X11WindowStatePtr, Point<i32>)> {
+        self.0.borrow().windows.values().find_map(|window_ref| {
+            let window = &window_ref.window;
+            let origin = window
+                .state
+                .borrow()
+                .native_views
+                .container_origin(container)?;
+            Some((window.clone(), origin))
+        })
+    }
+
+    /// The window that shows `view` as a native view.
+    fn native_view_window(&self, view: xproto::Window) -> Option<X11WindowStatePtr> {
+        self.0
+            .borrow()
+            .windows
+            .values()
+            .map(|window_ref| &window_ref.window)
+            .find(|window| window.state.borrow().native_views.contains_view(view))
+            .cloned()
+    }
+
+    /// Handles what a native view's container grabbed so that GPUI sees it
+    /// before the view. Returns the event, as if it happened in the window, if
+    /// it is for the window's own content.
+    fn route_native_view_event(&self, event: Event) -> Option<Event> {
+        match event {
+            Event::KeyPress(mut key_press) => {
+                let Some((window, _)) = self.native_view_container(key_press.event) else {
+                    return Some(Event::KeyPress(key_press));
+                };
+                // Without a view that has keyboard input, the key is for GPUI's own
+                // content, though the pointer is over a view.
+                let for_view = window.state.borrow().native_views.has_keyboard_input();
+                if for_view
+                    && !self
+                        .key_down_for_native_view(&key_press)
+                        .is_some_and(|key_down| window.offer_key_down_before_native_view(key_down))
+                {
+                    self.allow_key_events(xproto::Allow::REPLAY_KEYBOARD, key_press.time);
+                    return None;
+                }
+                // The key's release is GPUI's too, even if GPUI focuses a view meanwhile.
+                window
+                    .state
+                    .borrow_mut()
+                    .native_views
+                    .note_key_taken_before_view(key_press.detail);
+                self.allow_key_events(xproto::Allow::ASYNC_KEYBOARD, key_press.time);
+                // GPUI already handled a key it was offered ahead of the view.
+                (!for_view).then(|| {
+                    key_press.event = window.x_window;
+                    Event::KeyPress(key_press)
+                })
+            }
+            Event::KeyRelease(mut key_release) => {
+                let Some((window, _)) = self.native_view_container(key_release.event) else {
+                    return Some(Event::KeyRelease(key_release));
+                };
+                let views = &mut window.state.borrow_mut().native_views;
+                let is_for_gpui = views.take_key_taken_before_view(key_release.detail)
+                    || !views.has_keyboard_input();
+                is_for_gpui.then(|| {
+                    key_release.event = window.x_window;
+                    Event::KeyRelease(key_release)
+                })
+            }
+            Event::XinputButtonPress(mut press) => {
+                let Some((window, origin)) = self.native_view_container(press.event) else {
+                    return Some(Event::XinputButtonPress(press));
+                };
+                move_pointer_event_to_window(&mut press, window.x_window, origin);
+                let replay = match button_or_scroll_from_event_detail(press.detail) {
+                    Some(ButtonOrScroll::Button(_)) => {
+                        let scale_factor = self.0.borrow().scale_factor;
+                        let position = point(
+                            px(press.event_x as f32 / u16::MAX as f32 / scale_factor),
+                            px(press.event_y as f32 / u16::MAX as f32 / scale_factor),
+                        );
+                        // GPUI is told of the press too, which reaches nothing
+                        // behind the view but is outside every element in front.
+                        self.handle_event(Event::XinputButtonPress(press.clone()));
+                        window.native_view_pressed(position)
+                    }
+                    // The view scrolls, through motion events GPUI doesn't see.
+                    _ => true,
+                };
+                let event_mode = if replay {
+                    xinput::EventMode::REPLAY_DEVICE
+                } else {
+                    xinput::EventMode::ASYNC_DEVICE
+                };
+                let state = self.0.borrow();
+                state
+                    .xcb_connection
+                    .xinput_xi_allow_events(press.time, press.deviceid, event_mode, 0, x11rb::NONE)
+                    .log_err();
+                xcb_flush(&state.xcb_connection);
+                None
+            }
+            // A press that GPUI kept holds the pointer grabbed until its release.
+            Event::XinputButtonRelease(mut release) => {
+                if let Some((window, origin)) = self.native_view_container(release.event) {
+                    move_pointer_event_to_window(&mut release, window.x_window, origin);
+                }
+                Some(Event::XinputButtonRelease(release))
+            }
+            Event::XinputMotion(mut motion) => {
+                if let Some((window, origin)) = self.native_view_container(motion.event) {
+                    move_pointer_event_to_window(&mut motion, window.x_window, origin);
+                }
+                Some(Event::XinputMotion(motion))
+            }
+            // Keyboard grabs, such as the containers' own, move focus only for a moment.
+            Event::FocusIn(focus_in) if focus_in.mode == xproto::NotifyMode::NORMAL => {
+                let Some(window) = self.native_view_window(focus_in.event) else {
+                    return Some(Event::FocusIn(focus_in));
+                };
+                window.reconcile_native_view_focus();
+                None
+            }
+            event => Some(event),
+        }
+    }
+
+    /// Returns the key press `key_press` describes, unless it is of a modifier key.
+    fn key_down_for_native_view(
+        &self,
+        key_press: &xproto::KeyPressEvent,
+    ) -> Option<gpui::KeyDownEvent> {
+        let state = self.0.borrow();
+        let key_event_state = xkb_state_for_key_event(&state.xkb, key_press.state);
+        let code = key_press.detail.into();
+        if key_event_state.key_get_one_sym(code).is_modifier_key() {
+            return None;
+        }
+        let modifiers = modifiers_from_state(key_press.state);
+        Some(gpui::KeyDownEvent {
+            keystroke: keystroke_from_xkb(&key_event_state, modifiers, code),
+            is_held: false,
+            prefer_character_input: false,
+        })
+    }
+
+    fn allow_key_events(&self, allow: xproto::Allow, time: xproto::Timestamp) {
+        let state = self.0.borrow();
+        state.xcb_connection.allow_events(allow, time).log_err();
+        xcb_flush(&state.xcb_connection);
     }
 
     fn handle_event(&self, event: Event) -> Option<()> {
@@ -1059,6 +1218,14 @@ impl X11Client {
             }
             Event::FocusIn(event) => {
                 let window = self.get_window(event.event)?;
+                // The window manager gives keyboard input to the window itself,
+                // even when it takes it from a native view in the window.
+                window.reconcile_native_view_focus();
+                // Keyboard input moving between the window and a native view in it
+                // leaves the window active.
+                if event.detail == xproto::NotifyDetail::INFERIOR {
+                    return Some(());
+                }
                 window.set_active(true);
                 let mut state = self.0.borrow_mut();
                 state.keyboard_focused_window = Some(event.event);
@@ -1069,6 +1236,9 @@ impl X11Client {
                 self.enable_ime();
             }
             Event::FocusOut(event) => {
+                if event.detail == xproto::NotifyDetail::INFERIOR {
+                    return Some(());
+                }
                 let window = self.get_window(event.event)?;
                 window.set_active(false);
                 let mut state = self.0.borrow_mut();
@@ -1280,6 +1450,7 @@ impl X11Client {
                             click_count: current_count,
                             first_mouse: false,
                         }));
+                        window.reconcile_native_view_focus_after_press(position);
                     }
                     Some(ButtonOrScroll::Scroll(direction)) => {
                         drop(state);
@@ -2892,6 +3063,19 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
     );
 
     key_event_state
+}
+
+/// Makes a pointer event that a native view's container grabbed look as if it
+/// happened in the window, given the container's origin in it.
+fn move_pointer_event_to_window(
+    event: &mut xinput::ButtonPressEvent,
+    x_window: xproto::Window,
+    origin: Point<i32>,
+) {
+    event.event = x_window;
+    // Event coordinates are 16.16 fixed point numbers.
+    event.event_x += origin.x << 16;
+    event.event_y += origin.y << 16;
 }
 
 #[cfg(test)]
