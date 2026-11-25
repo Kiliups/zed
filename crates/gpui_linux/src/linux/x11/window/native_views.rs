@@ -262,13 +262,15 @@ pub(super) fn attach(
             ),
         )?;
         // A toolkit can give its window keyboard input as it maps it, which
-        // GPUI undoes, as only GPUI's focus or a click gives it to a view.
+        // GPUI undoes, as only GPUI's focus or a click gives it to a view. A
+        // view GPUI focused before it was mapped takes keyboard input once it is.
         check_reply(
             || "X11 ChangeWindowAttributes for a native view failed.",
             xcb.change_window_attributes(
                 view,
-                &xproto::ChangeWindowAttributesAux::new()
-                    .event_mask(xproto::EventMask::FOCUS_CHANGE),
+                &xproto::ChangeWindowAttributesAux::new().event_mask(
+                    xproto::EventMask::FOCUS_CHANGE | xproto::EventMask::STRUCTURE_NOTIFY,
+                ),
             ),
         )?;
         check_reply(

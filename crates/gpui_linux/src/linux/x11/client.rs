@@ -1009,6 +1009,13 @@ impl X11Client {
                 window.reconcile_native_view_focus();
                 None
             }
+            Event::MapNotify(map) => {
+                let Some(window) = self.native_view_window(map.window) else {
+                    return Some(Event::MapNotify(map));
+                };
+                window.reconcile_native_view_focus();
+                None
+            }
             event => Some(event),
         }
     }

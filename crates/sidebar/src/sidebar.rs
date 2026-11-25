@@ -5,6 +5,7 @@ use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::v2::schema as acp;
 use agent_settings::{AgentSettings, THREADS_LIST_MAX_WIDTH, THREADS_LIST_MIN_WIDTH};
+use agent_ui::t3code::T3CodeStore;
 use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
@@ -935,6 +936,11 @@ impl Sidebar {
 
         AgentThreadWorktreeLabelFlag::watch(cx);
 
+        if let Some(store) = T3CodeStore::try_global(cx) {
+            cx.observe(&store, |this, _, cx| this.update_entries(cx))
+                .detach();
+        }
+
         let mut previous_default_width =
             AgentSettings::get_global(cx).threads_sidebar.default_width;
         cx.observe_global::<SettingsStore>(move |this, cx| {
@@ -1345,9 +1351,7 @@ impl Sidebar {
         let panel = agent_panel.read(cx);
 
         if let Some(pending_thread_id) = self.pending_thread_activation {
-            let panel_thread_id = panel
-                .active_conversation_view()
-                .map(|cv| cv.read(cx).parent_id());
+            let panel_thread_id = panel.active_thread_id(cx);
 
             if panel_thread_id == Some(pending_thread_id) {
                 let session_id = panel
@@ -1835,6 +1839,67 @@ impl Sidebar {
                                 project_group_key: group_key.clone(),
                             },
                         ));
+                    }
+                }
+
+                if let Some(store) = T3CodeStore::try_global(cx) {
+                    let store = store.read(cx);
+                    if group_host.is_none()
+                        && store.workspace_root().is_some_and(|root| {
+                            group_key
+                                .path_list()
+                                .paths()
+                                .iter()
+                                .any(|path| path.as_path() == root)
+                        })
+                    {
+                        for thread in store.threads() {
+                            if !seen_thread_ids.insert(thread.thread_id) {
+                                continue;
+                            }
+                            if thread.status == AgentThreadStatus::Running {
+                                has_running_threads = true;
+                            }
+                            if thread.status == AgentThreadStatus::WaitingForConfirmation {
+                                waiting_thread_count += 1;
+                            }
+                            let folder_paths = group_key.path_list().clone();
+                            let Ok(worktree_paths) =
+                                WorktreePaths::from_path_lists(folder_paths.clone(), folder_paths)
+                            else {
+                                continue;
+                            };
+                            let metadata = ThreadMetadata {
+                                thread_id: thread.thread_id,
+                                session_id: Some(acp::SessionId::new(
+                                    thread.thread_id.to_key_string(),
+                                )),
+                                agent_id: AgentId::new(agent_ui::t3code::AGENT_ID),
+                                title: Some(thread.title.clone()),
+                                title_override: None,
+                                updated_at: thread.updated_at,
+                                created_at: Some(thread.updated_at),
+                                interacted_at: Some(thread.updated_at),
+                                worktree_paths,
+                                remote_connection: None,
+                                archived: false,
+                            };
+                            let workspace = resolve_workspace(metadata.folder_paths());
+                            threads.push(Arc::new(ThreadEntry {
+                                metadata,
+                                icon: IconName::Sparkle,
+                                icon_from_external_svg: None,
+                                status: thread.status,
+                                workspace,
+                                is_live: false,
+                                is_background: false,
+                                is_title_generating: false,
+                                draft: None,
+                                highlight_positions: Vec::new(),
+                                worktrees: Vec::new(),
+                                diff_stats: DiffStats::default(),
+                            }));
+                        }
                     }
                 }
 
@@ -6391,6 +6456,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let has_notification = self.contents.is_thread_notified(&thread.metadata.thread_id);
+        let is_t3_thread = thread.metadata.agent_id.as_ref() == agent_ui::t3code::AGENT_ID;
 
         let title: SharedString = thread.metadata.display_title();
         let metadata = thread.metadata.clone();
@@ -6478,7 +6544,7 @@ impl Sidebar {
             .when_some(rename_title_editor, |this, title_editor| {
                 this.is_truncated(false).title_slot(title_editor)
             })
-            .when(is_hovered && !is_renaming, |this| {
+            .when(is_hovered && !is_renaming && !is_t3_thread, |this| {
                 let rename_button = IconButton::new(("rename-thread", ix), IconName::Pencil)
                     .hover_background(button_hover_bg)
                     .active_background(button_active_bg)
@@ -6614,6 +6680,10 @@ impl Sidebar {
         let Some(session_id) = thread.metadata.session_id.clone() else {
             return thread_item.into_any_element();
         };
+
+        if is_t3_thread {
+            return thread_item.into_any_element();
+        }
 
         let context_menu_id = SharedString::from(format!("thread-context-menu-{}", ix));
         let sidebar = cx.weak_entity();

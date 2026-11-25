@@ -509,6 +509,7 @@ dependencies = [
  "language_model_selector",
  "language_models",
  "languages",
+ "libc",
  "log",
  "lru",
  "lsp",

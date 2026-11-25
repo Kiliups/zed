@@ -1235,6 +1235,14 @@ pub struct AgentPanel {
     context_server_registry: Entity<ContextServerRegistry>,
     focus_handle: FocusHandle,
     base_view: BaseView,
+    /// T3 Code's web interface, created when it is first shown.
+    t3code: Option<Result<crate::t3code::WebView, SharedString>>,
+    /// The T3 Code thread the web view is showing, if any.
+    t3code_thread: Option<ThreadId>,
+    /// Whether T3 Code is shown in place of the base view.
+    showing_t3code: bool,
+    /// Signing in to T3 Code, before its web view is created.
+    t3code_start: Option<Task<()>>,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
@@ -1647,6 +1655,10 @@ impl AgentPanel {
         let panel = Self {
             workspace_id,
             base_view,
+            t3code: None,
+            t3code_thread: None,
+            showing_t3code: false,
+            t3code_start: None,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
             user_store,
@@ -3094,6 +3106,9 @@ impl AgentPanel {
         let draft = self.ensure_draft(source, window, cx);
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             if conversation_view.entity_id() == draft.entity_id() {
+                self.showing_t3code = false;
+                cx.emit(AgentPanelEvent::ActiveViewChanged);
+                cx.notify();
                 if focus {
                     self.activation_focus_handle(cx).focus(window, cx);
                 }
@@ -3379,6 +3394,9 @@ impl AgentPanel {
     }
 
     pub fn active_thread_id(&self, cx: &App) -> Option<ThreadId> {
+        if self.showing_t3code {
+            return self.t3code_thread;
+        }
         match &self.base_view {
             BaseView::AgentThread { conversation_view } => {
                 Some(conversation_view.read(cx).thread_id)
@@ -4431,6 +4449,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.showing_t3code = false;
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
 
@@ -4449,6 +4468,87 @@ impl AgentPanel {
             self.activation_focus_handle(cx).focus(window, cx);
         }
         cx.emit(AgentPanelEvent::ActiveViewChanged);
+    }
+
+    fn show_t3code(
+        &mut self,
+        thread_id: Option<ThreadId>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.showing_t3code = true;
+        let workspace_root = {
+            let project = self.project.read(cx);
+            project
+                .visible_worktrees(cx)
+                .find(|worktree| !worktree.read(cx).root_repo_is_linked_worktree())
+                .or_else(|| project.visible_worktrees(cx).next())
+                .map(|worktree| worktree.read(cx).abs_path())
+        };
+        let store = crate::t3code::T3CodeStore::try_global(cx);
+        // Read the clicked thread before switching workspaces, which clears the store.
+        let clicked_thread =
+            thread_id.and_then(|thread_id| store.as_ref()?.read(cx).thread(thread_id).cloned());
+        if let (Some(store), Some(workspace_root)) = (&store, &workspace_root) {
+            store.update(cx, |store, cx| {
+                store.ensure_workspace(workspace_root.as_ref().to_path_buf(), cx);
+            });
+        }
+        let target = match thread_id {
+            Some(_) => clicked_thread,
+            None => store
+                .as_ref()
+                .and_then(|store| store.read(cx).threads().first().cloned()),
+        };
+
+        if let Some(Ok(web_view)) = &self.t3code {
+            if let Some(target) = target
+                .as_ref()
+                .filter(|target| self.t3code_thread != Some(target.thread_id))
+            {
+                web_view.navigate(&target.path()).log_err();
+                self.t3code_thread = Some(target.thread_id);
+            }
+            if focus {
+                window.focus(&web_view.native_view.focus_handle(cx), cx);
+            }
+            cx.emit(AgentPanelEvent::ActiveViewChanged);
+            cx.notify();
+            return;
+        }
+
+        self.t3code_thread = target.as_ref().map(|thread| thread.thread_id);
+        self.t3code = None;
+        self.t3code_start = None;
+        let (script, background) =
+            crate::t3code::setup_script(workspace_root.as_deref(), target.as_ref(), cx);
+        self.t3code_start = Some(cx.spawn_in(window, async move |this, cx| {
+            let pairing = cx.background_spawn(crate::t3code::pairing()).await;
+            this.update_in(cx, |this, window, cx| {
+                this.t3code_start = None;
+                let web_view = pairing
+                    .map_err(|error| format!("Couldn't sign in to T3 Code: {error:#}"))
+                    .and_then(|pairing| {
+                        crate::t3code::new_web_view(&pairing, &script, background, window, cx)
+                    });
+                if let Ok(web_view) = &web_view {
+                    // The page sees keys before Zed does, so these have to stay reachable.
+                    web_view
+                        .native_view
+                        .reserve_action::<zed_actions::command_palette::Toggle>();
+                    web_view.native_view.reserve_action::<ToggleFocus>();
+                    if focus && this.showing_t3code {
+                        window.focus(&web_view.native_view.focus_handle(cx), cx);
+                    }
+                }
+                this.t3code = Some(web_view.map_err(SharedString::from));
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
     }
 
     fn refresh_base_view_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4592,6 +4692,10 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if agent.id().as_ref() == crate::t3code::AGENT_ID {
+            self.show_t3code(Some(thread_id), focus, window, cx);
+            return;
+        }
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.unarchive(thread_id, cx);
@@ -5142,6 +5246,11 @@ impl Panel for AgentPanel {
     }
 
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.showing_t3code
+            && let Some(Ok(web_view)) = &self.t3code
+        {
+            return web_view.native_view.focus_handle(cx);
+        }
         match self.visible_surface() {
             VisibleSurface::Uninitialized => self.focus_handle.clone(),
             VisibleSurface::AgentThread(conversation_view) => {
@@ -5987,7 +6096,9 @@ impl AgentPanel {
         let supports_terminal = self.supports_terminal(cx);
         let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
 
-        let (selected_agent_custom_icon, selected_agent_label) = if showing_terminal {
+        let (selected_agent_custom_icon, selected_agent_label) = if self.showing_t3code {
+            (None, SharedString::from("T3 Code"))
+        } else if showing_terminal {
             (None, SharedString::from("Terminal"))
         } else if let Agent::Custom { id, .. } = &self.selected_agent {
             let store = agent_server_store.read(cx);
@@ -6083,6 +6194,25 @@ impl AgentPanel {
                                     }),
                             )
                         })
+                        .item(
+                            ContextMenuEntry::new("T3 Code")
+                                .icon(IconName::Sparkle)
+                                .icon_color(Color::Muted)
+                                .handler({
+                                    let workspace = workspace.clone();
+                                    move |window, cx| {
+                                        if let Some(panel) =
+                                            workspace.upgrade().and_then(|workspace| {
+                                                workspace.read(cx).panel::<AgentPanel>(cx)
+                                            })
+                                        {
+                                            panel.update(cx, |panel, cx| {
+                                                panel.show_t3code(None, true, window, cx);
+                                            });
+                                        }
+                                    }
+                                }),
+                        )
                         .map(|mut menu| {
                             let agent_server_store = agent_server_store.read(cx);
                             let registry_store = project::AgentRegistryStore::try_global(cx);
@@ -6194,7 +6324,9 @@ impl AgentPanel {
             .unwrap_or(false);
 
         let has_custom_icon = selected_agent_custom_icon.is_some();
-        let selected_agent_builtin_icon = if showing_terminal {
+        let selected_agent_builtin_icon = if self.showing_t3code {
+            Some(IconName::Sparkle)
+        } else if showing_terminal {
             Some(IconName::Terminal)
         } else {
             self.selected_agent.icon()
@@ -6324,6 +6456,7 @@ impl AgentPanel {
                         .pl(DynamicSpacing::Base04.rems(cx))
                         .child(selected_agent.into_any_element())
                         .child(match empty_thread_title {
+                            _ if self.showing_t3code => div().into_any_element(),
                             Some(title) => title,
                             None => self.render_title_view(window, cx),
                         }),
@@ -6756,8 +6889,19 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
-            .children(self.render_new_user_onboarding(window, cx))
+            .when(!self.showing_t3code, |this| {
+                this.children(self.render_new_user_onboarding(window, cx))
+            })
             .map(|parent| match self.visible_surface() {
+                _ if self.showing_t3code => match &self.t3code {
+                    Some(Ok(web_view)) => parent.child(web_view.native_view.clone()),
+                    Some(Err(error)) => parent.child(
+                        div()
+                            .p_4()
+                            .child(Label::new(error.clone()).color(Color::Error)),
+                    ),
+                    None => parent,
+                },
                 VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
                     parent.child(self.render_no_project_state(cx))
                 }

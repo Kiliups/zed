@@ -38,6 +38,10 @@ impl ThreadId {
         Self(uuid::Uuid::new_v4())
     }
 
+    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
+        Self(uuid)
+    }
+
     /// Stable, hyphenated string form suitable for use as a key.
     pub fn to_key_string(&self) -> String {
         self.0.hyphenated().to_string()
