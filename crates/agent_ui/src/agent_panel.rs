@@ -1,7 +1,7 @@
 use std::{
     cell::Cell,
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc,
@@ -1628,6 +1628,7 @@ impl AgentPanel {
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
+                    this.register_t3code_workspace(cx);
                     cx.notify();
                 }
                 _ => {}
@@ -1699,6 +1700,7 @@ impl AgentPanel {
         };
 
         panel.ensure_native_agent_connection(cx);
+        panel.register_t3code_workspace(cx);
         panel
     }
 
@@ -4488,6 +4490,33 @@ impl AgentPanel {
         cx.emit(AgentPanelEvent::ActiveViewChanged);
     }
 
+    /// The folder T3 Code threads of this panel's project belong to.
+    fn t3code_workspace_root(&self, cx: &App) -> Option<Arc<Path>> {
+        let project = self.project.read(cx);
+        // `t3` runs on this machine, so it can't see a remote project's folders.
+        if !project.is_local() {
+            return None;
+        }
+        project
+            .visible_worktrees(cx)
+            .find(|worktree| !worktree.read(cx).root_repo_is_linked_worktree())
+            .or_else(|| project.visible_worktrees(cx).next())
+            .map(|worktree| worktree.read(cx).abs_path())
+    }
+
+    /// Lists the project's T3 Code threads in the sidebar without the T3 Code view being opened.
+    fn register_t3code_workspace(&self, cx: &mut App) {
+        let (Some(store), Some(workspace_root)) = (
+            crate::t3code::T3CodeStore::try_global(cx),
+            self.t3code_workspace_root(cx),
+        ) else {
+            return;
+        };
+        store.update(cx, |store, cx| {
+            store.ensure_workspace(workspace_root.to_path_buf(), cx);
+        });
+    }
+
     fn show_t3code(
         &mut self,
         thread_id: Option<ThreadId>,
@@ -4496,29 +4525,16 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self.showing_t3code = true;
-        let workspace_root = {
-            let project = self.project.read(cx);
-            project
-                .visible_worktrees(cx)
-                .find(|worktree| !worktree.read(cx).root_repo_is_linked_worktree())
-                .or_else(|| project.visible_worktrees(cx).next())
-                .map(|worktree| worktree.read(cx).abs_path())
-        };
-        let store = crate::t3code::T3CodeStore::try_global(cx);
-        // Read the clicked thread before switching workspaces, which clears the store.
-        let clicked_thread =
-            thread_id.and_then(|thread_id| store.as_ref()?.read(cx).thread(thread_id).cloned());
-        if let (Some(store), Some(workspace_root)) = (&store, &workspace_root) {
-            store.update(cx, |store, cx| {
-                store.ensure_workspace(workspace_root.as_ref().to_path_buf(), cx);
-            });
-        }
-        let target = match thread_id {
-            Some(_) => clicked_thread,
-            None => store
-                .as_ref()
-                .and_then(|store| store.read(cx).threads().first().cloned()),
-        };
+        let workspace_root = self.t3code_workspace_root(cx);
+        self.register_t3code_workspace(cx);
+        let target = crate::t3code::T3CodeStore::try_global(cx).and_then(|store| {
+            let store = store.read(cx);
+            match (thread_id, &workspace_root) {
+                (Some(thread_id), _) => store.thread(thread_id).cloned(),
+                (None, Some(workspace_root)) => store.threads(workspace_root).first().cloned(),
+                (None, None) => None,
+            }
+        });
 
         if let Some(Ok(web_view)) = &self.t3code {
             if let Some(target) = target
@@ -4541,8 +4557,14 @@ impl AgentPanel {
         self.t3code_start = None;
         let (script, background) =
             crate::t3code::setup_script(workspace_root.as_deref(), target.as_ref(), cx);
+        let workspace_root = workspace_root.map(|root| root.to_path_buf());
         self.t3code_start = Some(cx.spawn_in(window, async move |this, cx| {
-            let pairing = cx.background_spawn(crate::t3code::pairing()).await;
+            let pairing = cx
+                .background_spawn(crate::t3code::pairing(
+                    cx.background_executor().clone(),
+                    workspace_root,
+                ))
+                .await;
             this.update_in(cx, |this, window, cx| {
                 this.t3code_start = None;
                 let web_view = pairing

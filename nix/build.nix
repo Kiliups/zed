@@ -49,6 +49,7 @@
   sqlite,
   vulkan-loader,
   wayland,
+  webkitgtk_4_1,
   xorg,
   zlib,
   zstd,
@@ -260,6 +261,8 @@ let
             gpu-lib
             wayland
             libva
+            # `agent_ui` dlopens it to show T3 Code
+            webkitgtk_4_1
           ]
         }";
 

@@ -2,15 +2,19 @@
 
 use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Utc};
-use gpui::{App, AppContext as _, Context, Entity, Global, Rgba, SharedString, Task};
+use gpui::{
+    App, AppContext as _, BackgroundExecutor, Context, Entity, Global, Rgba, SharedString, Task,
+};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::LazyLock,
     time::Duration,
 };
 use theme::ActiveTheme as _;
 use ui::AgentThreadStatus;
+use util::command::Stdio;
 
 use crate::ThreadId;
 
@@ -65,13 +69,17 @@ impl T3Thread {
     }
 }
 
-/// T3 Code's threads for the workspace whose web view is open, refreshed while it is shown.
+/// T3 Code's threads for each workspace root an agent panel has registered, kept current.
 pub struct T3CodeStore {
-    workspace_root: Option<PathBuf>,
+    workspaces: BTreeMap<PathBuf, T3Workspace>,
+    poll_task: Option<Task<()>>,
+}
+
+#[derive(Default)]
+struct T3Workspace {
     threads: Vec<T3Thread>,
     project_ready: bool,
     refresh_task: Option<Task<()>>,
-    poll_task: Option<Task<()>>,
 }
 
 struct GlobalT3CodeStore(Entity<T3CodeStore>);
@@ -83,10 +91,7 @@ impl T3CodeStore {
             return;
         }
         let store = cx.new(|_| Self {
-            workspace_root: None,
-            threads: Vec::new(),
-            project_ready: false,
-            refresh_task: None,
+            workspaces: BTreeMap::new(),
             poll_task: None,
         });
         cx.set_global(GlobalT3CodeStore(store));
@@ -101,37 +106,36 @@ impl T3CodeStore {
         cx.global::<GlobalT3CodeStore>().0.clone()
     }
 
-    pub fn workspace_root(&self) -> Option<&Path> {
-        self.workspace_root.as_deref()
-    }
-
-    pub fn threads(&self) -> &[T3Thread] {
-        &self.threads
+    pub fn threads(&self, root: &Path) -> &[T3Thread] {
+        self.workspaces
+            .get(root)
+            .map_or(&[], |workspace| &workspace.threads)
     }
 
     pub fn thread(&self, thread_id: ThreadId) -> Option<&T3Thread> {
-        self.threads
-            .iter()
+        self.workspaces
+            .values()
+            .flat_map(|workspace| &workspace.threads)
             .find(|thread| thread.thread_id == thread_id)
     }
 
-    /// Makes `root` the workspace whose threads are listed, and keeps them current from then on.
+    /// Lists `root`'s threads, and keeps them current from then on.
     pub fn ensure_workspace(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        if self.workspace_root.as_ref() != Some(&root) {
-            self.workspace_root = Some(root);
-            self.project_ready = false;
-            self.threads.clear();
-            self.refresh_task = None;
-            cx.notify();
-        }
-        self.refresh(cx);
+        self.workspaces.entry(root.clone()).or_default();
+        self.refresh(root, cx);
         if self.poll_task.is_none() {
             self.poll_task = Some(cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor()
                         .timer(Duration::from_secs(10))
                         .await;
-                    if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                    let refreshed = this.update(cx, |this, cx| {
+                        let roots = this.workspaces.keys().cloned().collect::<Vec<_>>();
+                        for root in roots {
+                            this.refresh(root, cx);
+                        }
+                    });
+                    if refreshed.is_err() {
                         break;
                     }
                 }
@@ -139,30 +143,35 @@ impl T3CodeStore {
         }
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.refresh_task.is_some() {
-            return;
-        }
-        let Some(root) = self.workspace_root.clone() else {
+    fn refresh(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspaces.get_mut(&root) else {
             return;
         };
-        let add_project = !self.project_ready;
-        self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let project_ready = if add_project {
-                ensure_project(&root).await.is_ok()
-            } else {
-                true
-            };
-            let threads = list_threads(&root).await;
-            this.update(cx, |this, cx| {
-                this.refresh_task = None;
-                if this.workspace_root.as_ref() != Some(&root) {
-                    return;
+        if workspace.refresh_task.is_some() {
+            return;
+        }
+        let add_project = !workspace.project_ready;
+        workspace.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let threads = with_server(&executor, || async {
+                if add_project {
+                    ensure_project(&root).await?;
                 }
-                this.project_ready = project_ready;
-                if let Ok(threads) = threads {
-                    this.threads = threads;
-                    cx.notify();
+                list_threads(&root).await
+            })
+            .await;
+            this.update(cx, |this, cx| {
+                let Some(workspace) = this.workspaces.get_mut(&root) else {
+                    return;
+                };
+                workspace.refresh_task = None;
+                match threads {
+                    Ok(threads) => {
+                        workspace.project_ready = true;
+                        workspace.threads = threads;
+                        cx.notify();
+                    }
+                    Err(error) => log::warn!("couldn't list T3 Code threads: {error:#}"),
                 }
             })
             .ok();
@@ -180,11 +189,21 @@ async fn ensure_project(root: &Path) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("ProjectAlreadyExistsError") {
+    let printed = printed(&output);
+    if printed.contains("ProjectAlreadyExistsError") {
         return Ok(());
     }
-    bail!("`t3 project add` failed: {stderr}");
+    bail!("`t3 project add` failed: {printed}");
+}
+
+/// T3 Code's CLI prints its errors to stdout or stderr depending on its environment, so both are
+/// read.
+fn printed(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
 }
 
 #[derive(Deserialize)]
@@ -207,10 +226,7 @@ async fn list_threads(root: &Path) -> Result<Vec<T3Thread>> {
         .await
         .context("couldn't run `t3 thread list`")?;
     if !output.status.success() {
-        bail!(
-            "`t3 thread list` failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("`t3 thread list` failed: {}", printed(&output));
     }
     let entries: Vec<T3ThreadEntry> =
         serde_json::from_slice(&output.stdout).context("`t3 thread list` printed invalid JSON")?;
@@ -249,18 +265,71 @@ pub(crate) struct Pairing {
     pub(crate) url: String,
 }
 
-/// Mints a pairing with the server's own CLI.
-pub(crate) async fn pairing() -> Result<Pairing> {
+/// Adds `workspace_root` to T3 Code as a project, so that the page can open it, and mints a
+/// pairing with the server's own CLI.
+pub(crate) async fn pairing(
+    executor: BackgroundExecutor,
+    workspace_root: Option<PathBuf>,
+) -> Result<Pairing> {
+    with_server(&executor, || async {
+        if let Some(root) = &workspace_root {
+            ensure_project(root).await?;
+        }
+        mint_pairing().await
+    })
+    .await
+}
+
+/// Runs `operation`, starting T3 Code's server and retrying when none is running.
+async fn with_server<T, F: Future<Output = Result<T>>>(
+    executor: &BackgroundExecutor,
+    operation: impl Fn() -> F,
+) -> Result<T> {
+    // `t3` calls run one at a time, so that only one of them starts a server, and so that
+    // `t3 project add`, which takes the server's place while none runs, can't race its start.
+    static SERVER_LOCK: LazyLock<futures::lock::Mutex<()>> =
+        LazyLock::new(|| futures::lock::Mutex::new(()));
+    let _guard = SERVER_LOCK.lock().await;
+    match operation().await {
+        Err(error) if is_no_running_server(&error) => {}
+        result => return result,
+    }
+    // The server isn't killed with Zed, like T3 Code's own background service, so that running
+    // agent turns outlive it.
+    let mut server = util::command::new_command("t3")
+        .args(["serve", "--no-browser"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("couldn't start `t3 serve`")?;
+    for _ in 0..60 {
+        executor.timer(Duration::from_millis(500)).await;
+        match operation().await {
+            Err(error) if is_no_running_server(&error) => {}
+            result => return result,
+        }
+        if let Some(status) = server.try_status()? {
+            bail!("`t3 serve` exited with {status}");
+        }
+    }
+    bail!("`t3 serve` didn't start within 30 seconds")
+}
+
+/// `t3 pair` reports a missing server as "No running T3 Code server found.", and the other
+/// commands as "No running T3 Code server uses …".
+fn is_no_running_server(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("No running T3 Code server")
+}
+
+async fn mint_pairing() -> Result<Pairing> {
     let output = util::command::new_command("t3")
         .args(["pair", "--ttl", "1m", "--label", "Zed"])
         .output()
         .await
         .context("couldn't run `t3 pair`")?;
     if !output.status.success() {
-        bail!(
-            "`t3 pair` failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("`t3 pair` failed: {}", printed(&output));
     }
     let url = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -286,13 +355,9 @@ pub(crate) fn setup_script(
 ) -> (String, Rgba) {
     let theme = cx.theme();
     let panel = Rgba::from(theme.colors().panel_background);
-    let project_name = workspace_root
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str());
     let setup = serde_json::json!({
         "theme": theme_for_t3(cx),
         "workspaceRoot": workspace_root.and_then(Path::to_str),
-        "projectName": project_name,
         "projectKey": target.map(|thread| format!("{}:{}", thread.environment_id, thread.project_id)),
         "targetPath": target.map(T3Thread::path),
     });
@@ -799,6 +864,15 @@ mod linux {
             let gtk_window =
                 function::<unsafe extern "C" fn(c_int) -> Object>(c"gtk_window_new")?(TOPLEVEL);
             let web_view = function::<unsafe extern "C" fn() -> Object>(c"webkit_web_view_new")?();
+            // WebKit's GPU compositing, embedded in another X11 client's window, paints nothing on
+            // NVIDIA's driver, so the page is rendered in software.
+            const HARDWARE_ACCELERATION_NEVER: c_int = 2;
+            let settings = function::<unsafe extern "C" fn(Object) -> Object>(
+                c"webkit_web_view_get_settings",
+            )?(web_view);
+            function::<unsafe extern "C" fn(Object, c_int)>(
+                c"webkit_settings_set_hardware_acceleration_policy",
+            )?(settings, HARDWARE_ACCELERATION_NEVER);
             // A `GdkRGBA`, which is four doubles.
             let background =
                 [background.r, background.g, background.b, background.a].map(f64::from);

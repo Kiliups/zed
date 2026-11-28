@@ -1903,16 +1903,13 @@ impl Sidebar {
 
                 if let Some(store) = T3CodeStore::try_global(cx) {
                     let store = store.read(cx);
-                    if group_host.is_none()
-                        && store.workspace_root().is_some_and(|root| {
-                            group_key
-                                .path_list()
-                                .paths()
-                                .iter()
-                                .any(|path| path.as_path() == root)
-                        })
-                    {
-                        for thread in store.threads() {
+                    if group_host.is_none() {
+                        for thread in group_key
+                            .path_list()
+                            .paths()
+                            .iter()
+                            .flat_map(|path| store.threads(path))
+                        {
                             if !seen_thread_ids.insert(thread.thread_id) {
                                 continue;
                             }

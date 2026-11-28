@@ -1515,6 +1515,7 @@ impl Render for TerminalView {
                 // TODO: Oddly this wrapper div is needed for TerminalElement to not steal events from the context menu
                 div()
                     .id("terminal-view-container")
+                    .pt_2()
                     .size_full()
                     .bg(cx.theme().colors().editor_background)
                     .when_some(self.background_corner_radii, |this, radii| {
