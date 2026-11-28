@@ -2684,7 +2684,6 @@ impl Snapshot {
             PathEntry {
                 id: entry.id,
                 path: entry.path.clone(),
-                is_ignored: entry.is_ignored,
                 scan_id: 0,
             },
             (),
@@ -2774,7 +2773,6 @@ impl Snapshot {
             entries_by_id_edits.push(Edit::Insert(PathEntry {
                 id: entry.id,
                 path: entry.path.clone(),
-                is_ignored: entry.is_ignored,
                 scan_id: 0,
             }));
             entries_by_path_edits.push(Edit::Insert(entry));
@@ -3108,7 +3106,6 @@ impl LocalSnapshot {
             PathEntry {
                 id: entry.id,
                 path: entry.path.clone(),
-                is_ignored: entry.is_ignored,
                 scan_id,
             },
             (),
@@ -3457,7 +3454,6 @@ impl BackgroundScannerState {
             entries_by_id_edits.push(Edit::Insert(PathEntry {
                 id: entry.id,
                 path: entry.path.clone(),
-                is_ignored: entry.is_ignored,
                 scan_id: self.snapshot.scan_id,
             }));
             entries_by_path_edits.push(Edit::Insert(entry));
@@ -3870,6 +3866,7 @@ async fn build_gitignore(abs_path: &Path, fs: &dyn Fs) -> Result<Gitignore> {
 }
 
 async fn build_gitignore_with_root(abs_path: &Path, root: &Path, fs: &dyn Fs) -> Result<Gitignore> {
+    anyhow::ensure!(fs.is_file(abs_path).await, "{abs_path:?} is not a file");
     let contents = fs
         .load(abs_path)
         .await
@@ -4422,7 +4419,6 @@ impl sum_tree::ContextLessSummary for EntrySummary {
 struct PathEntry {
     id: ProjectEntryId,
     path: Arc<RelPath>,
-    is_ignored: bool,
     scan_id: usize,
 }
 
@@ -6306,7 +6302,6 @@ impl BackgroundScanner {
             let mut path_entry = path_entry.clone();
             let mut entry = entry.clone();
             path_entry.scan_id = state.snapshot.scan_id;
-            path_entry.is_ignored = is_ignored;
             entry.is_ignored = is_ignored;
             if let Err(index) = state.changed_paths.binary_search(&path) {
                 state.changed_paths.insert(index, path);
@@ -7714,10 +7709,12 @@ async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<P
     let mut repository_dir_abs_path = dot_git_abs_path.clone();
     let mut common_dir_abs_path = dot_git_abs_path.clone();
 
-    if let Some(path) = fs
-        .load(dot_git_abs_path)
-        .await
-        .ok()
+    let gitfile = if fs.is_file(dot_git_abs_path).await {
+        fs.load(dot_git_abs_path).await.ok()
+    } else {
+        None
+    };
+    if let Some(path) = gitfile
         .as_ref()
         .and_then(|contents| parse_gitfile(contents).log_err())
     {
@@ -7726,7 +7723,9 @@ async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<P
             repository_dir_abs_path = Path::new(&path).into();
             common_dir_abs_path = repository_dir_abs_path.clone();
 
-            if let Some(commondir_contents) = fs.load(&path.join("commondir")).await.ok()
+            let commondir_abs_path = path.join("commondir");
+            if fs.is_file(&commondir_abs_path).await
+                && let Some(commondir_contents) = fs.load(&commondir_abs_path).await.ok()
                 && let Some(commondir_path) = fs
                     .canonicalize(&resolve_commondir_path(&path, &commondir_contents))
                     .await
@@ -8190,11 +8189,6 @@ mod tests {
             assert!(ignore_jobs.is_empty());
 
             state.snapshot.check_invariants(false);
-            for entry in &expected_entries {
-                let path_entry = state.snapshot.entries_by_id.get(&entry.id, ()).unwrap();
-
-                assert_eq!(path_entry.is_ignored, entry.is_ignored);
-            }
             assert_eq!(
                 state.changed_paths,
                 vec![rel_path("directory/child.txt").into_arc()]
